@@ -42,9 +42,10 @@ function saveStats() {
 
 loadStats();
 
-function getStats(clientId) {
+function getStats(clientId, clientName) {
   if (!playerStats.has(clientId)) {
     playerStats.set(clientId, {
+      name: clientName || 'Unknown',
       hyphens: 0,
       hyphenWords: 0,
       bestWord: '',
@@ -52,7 +53,11 @@ function getStats(clientId) {
       maxStreak: 0
     });
   }
-  return playerStats.get(clientId);
+  const stats = playerStats.get(clientId);
+  if (clientName && stats.name !== clientName) {
+    stats.name = clientName;
+  }
+  return stats;
 }
 
 function countHyphens(word) {
@@ -60,7 +65,7 @@ function countHyphens(word) {
 }
 
 addon.registerCommand('hyphens', (client, args) => {
-  const stats = getStats(client.id);
+  const stats = getStats(client.id, client.name);
   const avgHyphens = stats.hyphenWords > 0 ? (stats.hyphens / stats.hyphenWords).toFixed(1) : 0;
 
   addon.sendEmbed(client.id, {
@@ -79,14 +84,11 @@ addon.registerCommand('hyphens', (client, args) => {
 
 addon.registerCommand('top', (client, args) => {
   const allStats = Array.from(playerStats.entries())
-    .map(([id, stats]) => {
-      const playerClient = addon.getClient(id);
-      return {
-        name: playerClient?.name || 'Unknown',
-        hyphens: stats.hyphens || 0,
-        bestWord: stats.bestWord || ''
-      };
-    })
+    .map(([id, stats]) => ({
+      name: stats.name || 'Unknown',
+      hyphens: stats.hyphens || 0,
+      bestWord: stats.bestWord || ''
+    }))
     .filter(p => p.hyphens > 0)
     .sort((a, b) => b.hyphens - a.hyphens)
     .slice(0, 5);
@@ -110,7 +112,7 @@ addon.registerCommand('top', (client, args) => {
 });
 
 addon.registerCommand('streak', (client, args) => {
-  const stats = getStats(client.id);
+  const stats = getStats(client.id, client.name);
 
   let message = '';
   if (stats.streak > 0) {
@@ -138,7 +140,7 @@ addon.on('ready', (id) => {
 });
 
 addon.on('start', (data, client) => {
-  const stats = getStats(client.id);
+  const stats = getStats(client.id, client.name);
   stats.streak = 0;
 });
 
@@ -147,7 +149,7 @@ addon.on('submit', (data, client) => {
 
   const hyphens = countHyphens(data.word);
   if (hyphens === 0) {
-    const stats = getStats(client.id);
+    const stats = getStats(client.id, client.name);
     if (stats.streak >= 3) {
       addon.sendChat(client.id, `Hyphen streak ended at ${stats.streak}`);
     }
@@ -155,7 +157,7 @@ addon.on('submit', (data, client) => {
     return;
   }
 
-  const stats = getStats(client.id);
+  const stats = getStats(client.id, client.name);
   stats.hyphens += hyphens;
   stats.hyphenWords++;
   stats.streak++;
@@ -188,7 +190,7 @@ addon.on('submit', (data, client) => {
 });
 
 addon.on('end', (data, client) => {
-  const stats = getStats(client.id);
+  const stats = getStats(client.id, client.name);
   if (stats.streak >= 3) {
     addon.sendChat(client.id, `Game over. Final hyphen streak: ${stats.streak}`);
   }
