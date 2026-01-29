@@ -1,4 +1,4 @@
-const { io } = require('socket.io-client');
+const WebSocket = require('ws');
 
 class WordBombAddon {
   constructor(token, options = {}) {
@@ -8,11 +8,16 @@ class WordBombAddon {
     this.practice = options.practice || false;
     this.welcome = options.welcome || '';
     this.permissions = options.permissions || [];
-    this.socket = null;
+    this.ws = null;
     this.addonId = null;
     this.clients = new Map();
     this.handlers = {};
     this.commands = new Map();
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.reconnectDelay = 1000;
+    this.pendingCallbacks = new Map();
+    this.callbackId = 0;
     setTimeout(() => this.connect(), 0);
   }
 
@@ -28,15 +33,12 @@ class WordBombAddon {
   }
 
   connect() {
-    this.socket = io('https://ws.wordbomb.io', {
-      reconnection: true,
-      reconnectionAttempts: 10,
-      reconnectionDelay: 1000
-    });
+    this.ws = new WebSocket('wss://ws.wordbomb.io');
 
-    this.socket.on('connect', () => {
+    this.ws.on('open', () => {
+      this.reconnectAttempts = 0;
       this.emit('connected');
-      this.socket.emit('addon-register', {
+      this.sendEvent('addon-register', {
         token: this.token,
         name: this.name,
         desc: this.desc,
@@ -47,64 +49,103 @@ class WordBombAddon {
       });
     });
 
-    this.socket.on('addon-result', (data) => {
-      if (data.ok) {
-        this.addonId = data.id;
-        this.emit('ready', data.id);
-      } else {
-        this.emit('error', data.err);
-      }
+    this.ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        const event = msg.e;
+        const payload = msg.d;
+
+        if (event === 'addon-result') {
+          if (payload.ok) {
+            this.addonId = payload.id;
+            this.emit('ready', payload.id);
+          } else {
+            this.emit('error', payload.err);
+          }
+          return;
+        }
+
+        if (event === 'client-register') {
+          this.clients.set(payload.id, {
+            id: payload.id,
+            name: payload.name,
+            session: payload.session
+          });
+          this.emit('register', { id: payload.id, name: payload.name }, payload.session);
+          return;
+        }
+
+        if (event === 'client-unregister') {
+          this.clients.delete(payload.id);
+          this.emit('unregister', { id: payload.id, name: payload.name });
+          return;
+        }
+
+        if (event === 'client-connect') {
+          this.clients.set(payload.id, {
+            id: payload.id,
+            name: payload.name,
+            session: payload.session
+          });
+          this.emit('connect', { id: payload.id, name: payload.name }, payload.session);
+          return;
+        }
+
+        if (event === 'client-disconnect') {
+          this.clients.delete(payload.id);
+          this.emit('disconnect', { id: payload.id, name: payload.name });
+          return;
+        }
+
+        if (event === 'event') {
+          const client = this.clients.get(payload.client);
+          if (!client) return;
+
+          if (payload.event === 'command') {
+            const handler = this.commands.get(payload.data.command);
+            if (handler) handler(client, payload.data.args || '');
+            return;
+          }
+
+          const evtName = payload.event.startsWith('g:') ? payload.event.slice(2) : payload.event;
+          if (this.handlers[evtName]) {
+            this.handlers[evtName](payload.data, client);
+          }
+          return;
+        }
+
+        if (event === 'addon-dm-result') {
+          const cb = this.pendingCallbacks.get('dm');
+          if (cb) {
+            this.pendingCallbacks.delete('dm');
+            if (payload.ok) cb.resolve();
+            else cb.reject(payload.err || 'Failed');
+          }
+          return;
+        }
+      } catch {}
     });
 
-    this.socket.on('client-register', (data) => {
-      this.clients.set(data.id, {
-        id: data.id,
-        name: data.name,
-        session: data.session
-      });
-      this.emit('register', { id: data.id, name: data.name }, data.session);
+    this.ws.on('close', (code, reason) => {
+      this.emit('offline', reason?.toString() || 'Connection closed');
+      this.scheduleReconnect();
     });
 
-    this.socket.on('client-unregister', (data) => {
-      this.clients.delete(data.id);
-      this.emit('unregister', { id: data.id, name: data.name });
+    this.ws.on('error', (err) => {
+      this.emit('error', err.message);
     });
-
-    this.socket.on('client-connect', (data) => {
-      this.clients.set(data.id, {
-        id: data.id,
-        name: data.name,
-        session: data.session
-      });
-      this.emit('connect', { id: data.id, name: data.name }, data.session);
-    });
-
-    this.socket.on('client-disconnect', (data) => {
-      this.clients.delete(data.id);
-      this.emit('disconnect', { id: data.id, name: data.name });
-    });
-
-    this.socket.on('event', (data) => {
-      const client = this.clients.get(data.client);
-      if (!client) return;
-
-      if (data.event === 'command') {
-        const handler = this.commands.get(data.data.command);
-        if (handler) handler(client, data.data.args || '');
-        return;
-      }
-
-      const event = data.event.startsWith('g:') ? data.event.slice(2) : data.event;
-
-      if (this.handlers[event]) {
-        this.handlers[event](data.data, client);
-      }
-    });
-
-    this.socket.on('disconnect', (reason) => this.emit('offline', reason));
-    this.socket.on('connect_error', (err) => this.emit('error', err.message));
 
     return this;
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.emit('error', 'Max reconnect attempts reached');
+      return;
+    }
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.min(this.reconnectAttempts, 5);
+    setTimeout(() => this.connect(), delay);
   }
 
   emit(event, ...args) {
@@ -113,13 +154,15 @@ class WordBombAddon {
     }
   }
 
+  sendEvent(event, data) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ e: event, d: data }));
+    } catch {}
+  }
+
   send(clientId, event, data) {
-    if (!this.socket) return;
-    this.socket.emit('addon-send', {
-      to: clientId,
-      event,
-      data
-    });
+    this.sendEvent('addon-send', { to: clientId, event, data });
   }
 
   sendChat(clientId, message) {
@@ -131,11 +174,7 @@ class WordBombAddon {
   }
 
   broadcast(event, data) {
-    if (!this.socket) return;
-    this.socket.emit('addon-broadcast', {
-      event,
-      data
-    });
+    this.sendEvent('addon-broadcast', { event, data });
   }
 
   broadcastChat(message) {
@@ -151,28 +190,30 @@ class WordBombAddon {
   }
 
   sendDiscordMessage(clientId, message) {
-    if (!this.socket) return Promise.reject('No socket');
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject('No connection');
+    }
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject('Timeout'), 10000);
-      this.socket.once('addon-dm-result', (data) => {
-        clearTimeout(timeout);
-        if (data.ok) resolve();
-        else reject(data.err || 'Failed');
-      });
-      this.socket.emit('addon-dm', { to: clientId, message });
+      const timeout = setTimeout(() => {
+        this.pendingCallbacks.delete('dm');
+        reject('Timeout');
+      }, 10000);
+      this.pendingCallbacks.set('dm', { resolve: () => { clearTimeout(timeout); resolve(); }, reject: (err) => { clearTimeout(timeout); reject(err); } });
+      this.sendEvent('addon-dm', { to: clientId, message });
     });
   }
 
   sendDiscordFile(clientId, fileName, fileContent) {
-    if (!this.socket) return Promise.reject('No socket');
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject('No connection');
+    }
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject('Timeout'), 10000);
-      this.socket.once('addon-dm-result', (data) => {
-        clearTimeout(timeout);
-        if (data.ok) resolve();
-        else reject(data.err || 'Failed');
-      });
-      this.socket.emit('addon-dm', { to: clientId, fileName, fileContent });
+      const timeout = setTimeout(() => {
+        this.pendingCallbacks.delete('dm');
+        reject('Timeout');
+      }, 10000);
+      this.pendingCallbacks.set('dm', { resolve: () => { clearTimeout(timeout); resolve(); }, reject: (err) => { clearTimeout(timeout); reject(err); } });
+      this.sendEvent('addon-dm', { to: clientId, fileName, fileContent });
     });
   }
 }

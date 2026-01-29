@@ -7,6 +7,6 @@
   },
   "dependencies": {
     "dotenv": "^16.6.1",
-    "socket.io-client": "^4.7.2"
+    "ws": "^8.18.0"
   }
 }
